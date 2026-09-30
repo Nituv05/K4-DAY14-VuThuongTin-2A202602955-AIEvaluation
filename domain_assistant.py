@@ -246,24 +246,43 @@ class OpenAIGenerator:
     def __init__(self, max_output_tokens: int = 300) -> None:
         api_key = os.getenv("OPENAI_API_KEY", "").strip()
         self.model = os.getenv("OPENAI_MODEL", "").strip()
+        base_url = os.getenv("OPENAI_BASE_URL", "").strip() or None
         if not api_key:
             raise RuntimeError("OPENAI_API_KEY is missing from .env")
         if not self.model:
             raise RuntimeError("OPENAI_MODEL is missing from .env")
-        self.client = OpenAI(api_key=api_key)
+        self.client = OpenAI(api_key=api_key, base_url=base_url)
         self.max_output_tokens = max_output_tokens
+        self.models_to_try = [
+            self.model,
+            "gemini-3.5-flash-lite",
+            "gemini-3.5-flash",
+        ]
 
     def generate(self, prompt: str) -> str:
-        response = self.client.responses.create(
-            model=self.model,
-            input=prompt,
-            temperature=0,
-            max_output_tokens=self.max_output_tokens,
-        )
-        answer = response.output_text.strip()
-        if not answer:
-            raise RuntimeError("OpenAI returned an empty answer")
-        return answer
+        last_error = None
+        for m in self.models_to_try:
+            for attempt in range(4):
+                try:
+                    chat_resp = self.client.chat.completions.create(
+                        model=m,
+                        messages=[{"role": "user", "content": prompt}],
+                        temperature=0,
+                        max_tokens=self.max_output_tokens,
+                    )
+                    answer = chat_resp.choices[0].message.content or ""
+                    answer = answer.strip()
+                    if answer:
+                        return answer
+                except Exception as e:
+                    last_error = e
+                    err_str = str(e)
+                    if "429" in err_str or "503" in err_str:
+                        time.sleep(2 * (attempt + 1))
+                    else:
+                        break
+
+        raise RuntimeError(f"Model generation failed after retries: {last_error}")
 
 
 @dataclass(frozen=True)
@@ -405,6 +424,17 @@ def generate_actual_answers(
         f"model={model}, top_k={top_k}"
     )
 
+    artifact_file = Path("artifacts/actual_answers.json")
+    existing_answers: dict[str, Any] = {}
+    if artifact_file.exists():
+        try:
+            cached_data = json.loads(artifact_file.read_text(encoding="utf-8"))
+            for ans in cached_data.get("answers", []):
+                if ans.get("id") and ans.get("actual_answer") and ans.get("error") is None:
+                    existing_answers[ans["id"]] = ans
+        except Exception:
+            pass
+
     answers: list[dict[str, Any]] = []
     for index, item in enumerate(questions, start=1):
         percentage = index / total
@@ -419,6 +449,12 @@ def generate_actual_answers(
             f"{item['id']} generating: {question_preview}"
         )
 
+        if item["id"] in existing_answers:
+            ans_record = existing_answers[item["id"]]
+            answers.append(ans_record)
+            notify(f"[{bar_before}] {index:02d}/{total:02d} | {item['id']} Cached OK")
+            continue
+
         started_at = time.perf_counter()
         try:
             response = assistant.answer_with_trace(item["question"])
@@ -426,23 +462,47 @@ def generate_actual_answers(
             notify(f"FAILED at {item['id']}; stopping the run.")
             raise
 
-        answers.append(
-            {
-                "id": item["id"],
-                "question": item["question"],
-                "actual_answer": response.actual_answer,
-                "retrieved_contexts": [
+        record = {
+            "id": item["id"],
+            "question": item["question"],
+            "actual_answer": response.actual_answer,
+            "retrieved_contexts": [
+                {
+                    "source_doc": chunk.source_doc,
+                    "chunk_id": chunk.chunk_id,
+                    "text": chunk.text,
+                    "score": round(chunk.score, 6),
+                }
+                for chunk in response.retrieved_chunks
+            ],
+            "error": None,
+        }
+        answers.append(record)
+
+        # Incrementally persist progress
+        try:
+            artifact_file.parent.mkdir(parents=True, exist_ok=True)
+            artifact_file.write_text(
+                json.dumps(
                     {
-                        "source_doc": chunk.source_doc,
-                        "chunk_id": chunk.chunk_id,
-                        "text": chunk.text,
-                        "score": round(chunk.score, 6),
-                    }
-                    for chunk in response.retrieved_chunks
-                ],
-                "error": None,
-            }
-        )
+                        "schema_version": "1.0",
+                        "corpus_id": assistant.corpus_id,
+                        "generated_at": datetime.now(UTC).isoformat(),
+                        "agent": {
+                            "name": "domain-assistant",
+                            "model": model,
+                            "top_k": top_k,
+                            "prompt_version": "1.0",
+                        },
+                        "answers": answers,
+                    },
+                    indent=2,
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
 
         filled_after = round(20 * percentage)
         bar_after = "#" * filled_after + "-" * (20 - filled_after)
